@@ -1,0 +1,385 @@
+# ================== PLACA 3 - TELEMETRÍA COMPLETA → NRF24L01 ==================
+# CON LIBRERÍA SIMPLE FUNCIONANDO
+
+from machine import UART, Pin, I2C, ADC, SPI
+import utime, struct
+
+# ---------------- CLASE NRF24L01 SIMPLE (FUNCIONA) ----------------
+class NRF24L01Simple:
+    def __init__(self, spi, csn, ce, channel=76):
+        self.spi = spi
+        self.csn = csn
+        self.ce = ce
+        self.channel = channel
+        self.payload_size = 32
+        self.init()
+    
+    def init(self):
+        # Power down primero
+        self.reg_write(0x00, 0x00)
+        utime.sleep_ms(5)
+        
+        # Configuración robusta
+        self.reg_write(0x00, 0x0E)  # CONFIG: PWR_UP, EN_CRC, CRC0
+        self.reg_write(0x01, 0x01)  # EN_AA: Auto ACK solo pipe 0
+        self.reg_write(0x02, 0x01)  # EN_RXADDR: Solo pipe 0
+        self.reg_write(0x03, 0x03)  # SETUP_AW: 5 bytes dirección
+        self.reg_write(0x04, 0x1F)  # SETUP_RETR: 15 reintentos, 1000us
+        self.reg_write(0x05, self.channel)  # RF_CH
+        self.reg_write(0x06, 0x26)  # RF_SETUP: 250kbps, 0dBm (robusto)
+        self.reg_write(0x07, 0x70)  # STATUS: Limpiar flags
+        
+        # Configurar tamaño de payload
+        self.reg_write(0x11, self.payload_size)  # RX_PW_P0
+        self.reg_write(0x12, self.payload_size)  # RX_PW_P1
+        
+        utime.sleep_ms(5)
+        print("✅ NRF24L01Simple inicializado correctamente")
+    
+    def reg_read(self, reg):
+        self.csn.value(0)
+        self.spi.write(bytes([reg & 0x1F]))
+        result = self.spi.read(1)
+        self.csn.value(1)
+        return result[0]
+    
+    def reg_write(self, reg, value):
+        self.csn.value(0)
+        self.spi.write(bytes([0x20 | (reg & 0x1F), value]))
+        self.csn.value(1)
+    
+    def open_tx_pipe(self, address):
+        # Escribir dirección RX (para auto-ACK)
+        self.csn.value(0)
+        self.spi.write(bytes([0x2A] + list(address)))  # RX_ADDR_P0
+        self.csn.value(1)
+        
+        # Escribir dirección TX
+        self.csn.value(0)
+        self.spi.write(bytes([0x30] + list(address)))  # TX_ADDR
+        self.csn.value(1)
+        
+        print(f"📍 Dirección TX configurada: {address.hex()}")
+    
+    def send(self, data):
+        if len(data) > self.payload_size:
+            data = data[:self.payload_size]
+        
+        # Limpiar flags
+        self.reg_write(0x07, 0x30)
+        
+        # Escribir payload
+        self.csn.value(0)
+        self.spi.write(bytes([0xA0]) + data)  # W_TX_PAYLOAD
+        self.csn.value(1)
+        
+        # Iniciar transmisión
+        self.ce.value(1)
+        utime.sleep_us(15)  # Pulso de 15us
+        self.ce.value(0)
+        
+        # Esperar transmisión (timeout 100ms)
+        start = utime.ticks_ms()
+        while utime.ticks_diff(utime.ticks_ms(), start) < 100:
+            status = self.reg_read(0x07)
+            if status & 0x30:  # TX_DS (éxito) o MAX_RT (fallo)
+                break
+            utime.sleep_ms(1)
+        
+        # Limpiar flags después de la transmisión
+        self.reg_write(0x07, 0x30)
+        
+        return status
+
+# ---------------- CONFIGURACIÓN ORIGINAL DE TU PROYECTO ----------------
+
+# UART0: Datos desde Placa 2
+uart2 = UART(0, baudrate=115200, rx=Pin(1))
+
+# UART1: GPS NEO-6M
+gps_uart = UART(1, baudrate=9600, tx=Pin(8), rx=Pin(9))
+
+# I2C0: MPU6050
+i2c = I2C(0, scl=Pin(5), sda=Pin(4), freq=400000)
+MPU_ADDR = 0x68
+mpu_ok = False
+
+# ADC: LM35
+lm35_adc = ADC(28)
+
+# Sensor de línea
+line_sensor = Pin(15, Pin.IN)
+
+# ---------------- NRF24L01 CON LIBRERÍA SIMPLE ----------------
+spi = SPI(1, sck=Pin(10), mosi=Pin(11), miso=Pin(12))
+csn = Pin(14, Pin.OUT, value=1)
+ce  = Pin(13, Pin.OUT, value=0)
+
+# Usar la nueva librería que SÍ funciona
+nrf = NRF24L01Simple(spi, csn, ce, channel=76)
+PIPE_TX = b"\xC3\xF0\xF0\xF0\xF0"
+nrf.open_tx_pipe(PIPE_TX)
+
+print("📡 NRF24L01 TX listo con librería simple (canal 76)")
+
+# ---------------- FUNCIONES ORIGINALES (sin cambios) ----------------
+
+def leer_lm35():
+    """Lee LM35 con promedio para estabilidad, retorno en °C."""
+    muestras = 20
+    suma = 0
+    validas = 0
+    for _ in range(muestras):
+        raw = lm35_adc.read_u16()
+        if raw > 0:
+            suma += raw
+            validas += 1
+        utime.sleep_ms(5)
+    if validas == 0:
+        return 0.0
+    raw_prom = suma / validas
+    volt = raw_prom * 3.3 / 65535.0
+    return volt * 100.0
+
+def mpu_init():
+    """Inicializa el MPU6050."""
+    global mpu_ok
+    devs = i2c.scan()
+    print("I2C encontrados:", devs)
+
+    if MPU_ADDR not in devs:
+        print("MPU6050 no encontrado en 0x68")
+        mpu_ok = False
+        return
+
+    try:
+        who = i2c.readfrom_mem(MPU_ADDR, 0x75, 1)[0]
+    except:
+        print("Error leyendo WHO_AM_I")
+        mpu_ok = False
+        return
+
+    if who != 0x68:
+        print("WHO_AM_I incorrecto:", hex(who))
+        mpu_ok = False
+        return
+
+    i2c.writeto_mem(MPU_ADDR, 0x6B, b'\x00')  # Wake up
+    utime.sleep_ms(100)
+    mpu_ok = True
+    print("✅ MPU6050 listo")
+
+def leer_mpu():
+    """Retorna (ax, ay, az en m/s2, gx, gy, gz en deg/s)."""
+    if not mpu_ok:
+        return 0.0, 0.0, 9.81, 0.0, 0.0, 0.0
+
+    try:
+        data = i2c.readfrom_mem(MPU_ADDR, 0x3B, 14)
+    except:
+        return 0.0, 0.0, 9.81, 0.0, 0.0, 0.0
+
+    ax = (data[0] << 8) | data[1]
+    ay = (data[2] << 8) | data[3]
+    az = (data[4] << 8) | data[5]
+    gx = (data[8] << 8) | data[9]
+    gy = (data[10] << 8) | data[11]
+    gz = (data[12] << 8) | data[13]
+
+    if ax & 0x8000: ax -= 65536
+    if ay & 0x8000: ay -= 65536
+    if az & 0x8000: az -= 65536
+    if gx & 0x8000: gx -= 65536
+    if gy & 0x8000: gy -= 65536
+    if gz & 0x8000: gz -= 65536
+
+    ax_ms2 = ax / 16384.0 * 9.81
+    ay_ms2 = ay / 16384.0 * 9.81
+    az_ms2 = az / 16384.0 * 9.81
+
+    gx_dps = gx / 131.0
+    gy_dps = gy / 131.0
+    gz_dps = gz / 131.0
+
+    return ax_ms2, ay_ms2, az_ms2, gx_dps, gy_dps, gz_dps
+
+# Funciones GPS (sin cambios)
+gps_lat = None
+gps_lon = None
+gps_alt = 0.0
+gps_spd = 0.0
+gps_fix = False
+
+def nmea_to_decimal(valor, hemi):
+    if not valor:
+        return None
+    try:
+        v = float(valor)
+    except:
+        return None
+    grados = int(v // 100)
+    minutos = v - grados * 100
+    dec = grados + minutos / 60.0
+    if hemi in ("S", "W"):
+        dec = -dec
+    return dec
+
+def procesar_gprmc(l):
+    global gps_lat, gps_lon, gps_spd, gps_fix
+    if not l.startswith("$GPRMC"):
+        return
+    p = l.split(',')
+    if len(p) < 8:
+        gps_fix = False
+        return
+    if p[2] != "A":
+        gps_fix = False
+        return
+
+    lat = nmea_to_decimal(p[3], p[4])
+    lon = nmea_to_decimal(p[5], p[6])
+
+    if lat is None or lon is None:
+        gps_fix = False
+        return
+
+    gps_lat = lat
+    gps_lon = lon
+
+    try:
+        spd_knots = float(p[7]) if p[7] else 0.0
+    except:
+        spd_knots = 0.0
+    gps_spd = spd_knots * 1.852
+    gps_fix = True
+
+def procesar_gpgga(l):
+    global gps_alt
+    if not l.startswith("$GPGGA"):
+        return
+    p = l.split(',')
+    if len(p) > 9 and p[9]:
+        try:
+            gps_alt = float(p[9])
+        except:
+            gps_alt = 0.0
+
+# ---------------- VARIABLES Y MAIN LOOP ----------------
+angulo    = None
+velocidad = None
+pwm_servo = None
+pwm_motor = None
+vbat      = None
+
+mpu_init()
+ultimo = utime.ticks_ms()
+
+print("🚀 Placa 3: Telemetría funcionando con NRF24L01Simple...")
+
+while True:
+    # UART0 desde Placa 2
+    if uart2.any():
+        try:
+            linea = uart2.readline()
+            if linea:
+                try:
+                    t = linea.decode().strip()
+                except:
+                    t = ""
+                if t:
+                    d = t.split(',')
+                    if len(d) == 5:
+                        try:
+                            angulo    = int(d[0])
+                            velocidad = int(d[1])
+                            pwm_servo = int(d[2])
+                            pwm_motor = int(d[3])
+                            vbat      = float(d[4])
+                        except:
+                            pass
+        except:
+            pass
+
+    # UART1 GPS
+    if gps_uart.any():
+        try:
+            l = gps_uart.readline()
+            if l:
+                try:
+                    s = l.decode().strip()
+                except:
+                    s = ""
+                if s.startswith("$GPRMC"):
+                    procesar_gprmc(s)
+                elif s.startswith("$GPGGA"):
+                    procesar_gpgga(s)
+        except:
+            pass
+
+    # Cada 200 ms enviar telemetría
+    ahora = utime.ticks_ms()
+    if utime.ticks_diff(ahora, ultimo) > 200:
+        ultimo = ahora
+
+        # Sensores locales
+        ax, ay, az, gx, gy, gz = leer_mpu()
+        temp_c = leer_lm35()
+        line_state = line_sensor.value()
+
+        # Empaquetar datos
+        lat_i = 0 if gps_lat is None else int(gps_lat * 100000)
+        lon_i = 0 if gps_lon is None else int(gps_lon * 100000)
+
+        alt_i = int(gps_alt)
+        spd_i = int(gps_spd * 10)
+
+        ax_i = int(ax * 100)
+        ay_i = int(ay * 100)
+        az_i = int(az * 100)
+        gx_i = int(gx * 100)
+        gy_i = int(gy * 100)
+        line_state_i = int(line_state)
+
+        vbat_i = 0 if vbat is None else int(vbat * 100)
+        temp_i = int(temp_c * 10)
+
+        pwm_servo_i = 0 if pwm_servo is None else int(pwm_servo)
+        pwm_motor_i = 0 if pwm_motor is None else int(pwm_motor)
+
+        # <ii12h = 2 int32 + 12 int16 -> 32 bytes
+        payload = struct.pack(
+            "<ii12h",
+            lat_i, lon_i,
+            alt_i, spd_i,
+            ax_i, ay_i, az_i,
+            gx_i, gy_i, line_state_i,
+            vbat_i, temp_i,
+            pwm_servo_i, pwm_motor_i
+        )
+
+        # ENVIAR con la nueva librería (¡QUE SÍ FUNCIONA!)
+        try:
+            status = nrf.send(payload)
+            if status & 0x10:
+                # ✅ Transmisión exitosa
+                pass
+            elif status & 0x20:
+                print("⚠️ NRF: MAX_RT (reintentos agotados)")
+        except Exception as e:
+            print(f"❌ Error envío NRF: {e}")
+
+        # Debug en consola
+        servo_txt = "Servo: ---" if angulo is None else f"Servo:{angulo:3d}° ({pwm_servo} us)"
+        motor_txt = "Motor: ---" if velocidad is None else f"Motor:{velocidad:3d}% ({pwm_motor} us)"
+        batt_txt  = "Batt: --.- V" if vbat is None else f"Batt:{vbat:0.2f} V"
+        acc_txt   = f"Acc:X:{ax:+0.2f} Y:{ay:+0.2f} Z:{az:+0.2f} m/s2"
+        gps_txt   = "GPS:NO FIX" if gps_lat is None else f"GPS:{gps_lat:.5f},{gps_lon:.5f} Alt:{gps_alt:.1f}"
+        temp_txt  = f"Temp:{temp_c:.1f}C"
+        line_txt  = "Linea:NEGRO" if line_state == 1 else "Linea:BLANCO"
+
+        print(
+            f"{servo_txt} | {motor_txt} | {batt_txt} | "
+            f"{acc_txt} | {gps_txt} | {temp_txt} | {line_txt}"
+        )
+
+    utime.sleep_ms(5)
